@@ -4,6 +4,7 @@ members = [
   "backit_token",
   "call_registry",
   "charity_markets",
+  "cross_chain_oracle_relay",
   "contracts/hello-world",
   "dutch_auction",
   "gas_station",

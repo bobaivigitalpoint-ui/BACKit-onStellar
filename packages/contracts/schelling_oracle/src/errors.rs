@@ -28,4 +28,14 @@ pub enum OracleError {
     AlreadyResolved = 22,
     TooManyVoters = 23,
     Overflow = 24,
+    PriceRoundNotFound = 25,
+    PriceRoundExists = 26,
+    /// The round's voting window is closed (or not yet closed, for finalisation).
+    PriceVotingClosed = 27,
+    PriceVotingOpen = 28,
+    /// Plain rounds take `submit_price_vote`; commit-reveal rounds take commit/reveal.
+    WrongRoundKind = 29,
+    AlreadyVoted = 30,
+    InvalidPrice = 31,
+    AlreadyFinalized = 32,
 }

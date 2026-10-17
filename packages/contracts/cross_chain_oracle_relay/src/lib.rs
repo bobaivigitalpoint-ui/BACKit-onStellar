@@ -2,6 +2,7 @@
 
 mod errors;
 mod events;
+pub mod proof;
 mod storage;
 mod types;
 
@@ -9,9 +10,9 @@ mod types;
 mod test;
 
 use errors::OracleRelayError;
-use events::{emit_header_submitted, emit_price_relayed};
+use events::{emit_header_submitted, emit_outcome_relayed, emit_price_relayed, emit_signers_set};
 use soroban_sdk::{
-    contract, contractimpl, Address, Bytes, BytesN, Env, String, Vec,
+    contract, contractimpl, Address, Bytes, BytesN, Env, IntoVal, String, Vec,
 };
 use storage::*;
 use types::{BlockHeader, CrossChainSource, OracleRelayConfig};
@@ -69,6 +70,7 @@ impl CrossChainOracleRelay {
 
         let block_hash = Self::compute_block_hash(&env, &header);
         add_trusted_hash(&env, header.block_number, &block_hash);
+        set_state_root(&env, header.block_number, &header.state_root);
         mark_block_relayed(&env, header.block_number);
 
         emit_header_submitted(&env, &relayer, header.block_number, &block_hash);
@@ -101,7 +103,14 @@ impl CrossChainOracleRelay {
             return Err(OracleRelayError::InvalidBlockHeader);
         }
 
-        Self::verify_merkle_proof(&env, &merkle_proof, &expected_root);
+        // The proof must fold the price leaf up to the state root of the block the
+        // relayer submitted (and the root the relayer claims).
+        let state_root = get_state_root(&env, block_number).ok_or(OracleRelayError::InvalidBlockHeader)?;
+        let leaf = proof::price_leaf(&env, &chain_name, block_number, price);
+        let computed = proof::compute_root(&env, &leaf, &merkle_proof);
+        if computed != state_root || expected_root != state_root {
+            return Err(OracleRelayError::MerkleProofVerificationFailed);
+        }
 
         let source = CrossChainSource {
             chain_name: chain_name.clone(),
@@ -113,6 +122,99 @@ impl CrossChainOracleRelay {
 
         emit_price_relayed(&env, &chain_name, price, block_number);
         Ok(())
+    }
+
+    /// Authorise the ed25519 keys that may attest outcomes from `chain_id`
+    /// (admin only). An empty list removes support for the chain.
+    pub fn set_chain_signers(env: Env, chain_id: u64, signers: Vec<BytesN<32>>) -> Result<(), OracleRelayError> {
+        let config = get_config(&env).ok_or(OracleRelayError::NotInitialized)?;
+        config.admin.require_auth();
+        emit_signers_set(&env, chain_id, signers.len());
+        set_chain_signers(&env, chain_id, &signers);
+        Ok(())
+    }
+
+    /// Relay a market outcome attested on a source chain (SC-024).
+    ///
+    /// Checks, in order: the relayer is trusted; the chain has signers and `signer`
+    /// is one of them; the outcome and price are in range; the Merkle proof folds
+    /// the outcome leaf up to the state root of a block this contract already
+    /// trusts; `signature` is `signer`'s ed25519 signature over the attestation
+    /// message for that root; and the (chain, market) outcome has not been relayed
+    /// before. It is then forwarded to the outcome manager in the same
+    /// transaction: if the outcome manager rejects it, the whole call reverts and
+    /// nothing is recorded.
+    ///
+    /// The outcome manager must expose
+    /// `submit_relayed_outcome(relay: Address, call_id: u64, outcome: u32, price: i128)`.
+    pub fn relay_outcome(
+        env: Env,
+        relayer: Address,
+        market_id: u64,
+        source_chain_id: u64,
+        outcome: u32,
+        final_price: i128,
+        block_number: u64,
+        signer: BytesN<32>,
+        merkle_proof: Vec<BytesN<32>>,
+        signature: BytesN<64>,
+    ) -> Result<(), OracleRelayError> {
+        relayer.require_auth();
+        let config = get_config(&env).ok_or(OracleRelayError::NotInitialized)?;
+        if !config.trusted_relayers.iter().any(|a| a == relayer) {
+            return Err(OracleRelayError::UnauthorizedRelayer);
+        }
+
+        let signers = get_chain_signers(&env, source_chain_id)
+            .filter(|s| !s.is_empty())
+            .ok_or(OracleRelayError::UnsupportedChain)?;
+        if !signers.iter().any(|s| s == signer) {
+            return Err(OracleRelayError::UnauthorizedSigner);
+        }
+        if outcome == 0 {
+            return Err(OracleRelayError::InvalidOutcome);
+        }
+        if final_price <= 0 || final_price > 1_000_000_000_000_000_000 {
+            return Err(OracleRelayError::PriceOutOfRange);
+        }
+        if is_outcome_relayed(&env, source_chain_id, market_id) {
+            return Err(OracleRelayError::OutcomeAlreadyRelayed);
+        }
+
+        let state_root = get_state_root(&env, block_number).ok_or(OracleRelayError::InvalidBlockHeader)?;
+        let leaf = proof::outcome_leaf(&env, source_chain_id, market_id, outcome, final_price);
+        if proof::compute_root(&env, &leaf, &merkle_proof) != state_root {
+            return Err(OracleRelayError::MerkleProofVerificationFailed);
+        }
+
+        // Traps (reverting the call) if the signature is not valid for `signer`.
+        let message = proof::attestation_message(&env, source_chain_id, market_id, outcome, final_price, &state_root);
+        env.crypto().ed25519_verify(&signer, &message, &signature);
+
+        mark_outcome_relayed(&env, source_chain_id, market_id);
+
+        let args = soroban_sdk::vec![
+            &env,
+            env.current_contract_address().into_val(&env),
+            market_id.into_val(&env),
+            outcome.into_val(&env),
+            final_price.into_val(&env),
+        ];
+        let forwarded = env.try_invoke_contract::<(), soroban_sdk::Error>(
+            &config.outcome_manager,
+            &soroban_sdk::Symbol::new(&env, "submit_relayed_outcome"),
+            args,
+        );
+        if !matches!(forwarded, Ok(Ok(()))) {
+            return Err(OracleRelayError::ForwardFailed);
+        }
+
+        emit_outcome_relayed(&env, market_id, source_chain_id, outcome, final_price);
+        Ok(())
+    }
+
+    pub fn is_outcome_relayed(env: Env, source_chain_id: u64, market_id: u64) -> bool {
+        storage::is_outcome_relayed(&env, source_chain_id, market_id)
     }
 
     pub fn get_cross_chain_source(env: Env, chain_name: String) -> Option<CrossChainSource> {
@@ -130,6 +232,11 @@ impl CrossChainOracleRelay {
             v.push_back(s);
         }
         v
+    }
+
+    /// The state root recorded for a relayed block.
+    pub fn get_state_root(env: Env, block_number: u64) -> Option<BytesN<32>> {
+        storage::get_state_root(&env, block_number)
     }
 
     pub fn get_trusted_block_hash(env: Env, block_number: u64) -> Option<BytesN<32>> {
@@ -155,23 +262,5 @@ impl CrossChainOracleRelay {
         raw.append(&Bytes::from_slice(env, &header.receipts_root.to_array()));
         raw.append(&Bytes::from_slice(env, &header.timestamp.to_be_bytes()));
         env.crypto().sha256(&raw).into()
-    }
-
-    fn verify_merkle_proof(
-        env: &Env,
-        proof: &Vec<BytesN<32>>,
-        _expected_root: &BytesN<32>,
-    ) {
-        if proof.is_empty() {
-            soroban_sdk::panic_with_error!(env, OracleRelayError::MerkleProofVerificationFailed);
-        }
-        let mut computed: BytesN<32> = proof.get(0).unwrap();
-        for i in 1..proof.len() {
-            let next: BytesN<32> = proof.get(i).unwrap();
-            let mut combined = Bytes::from_slice(env, b"merkle:");
-            combined.append(&Bytes::from_slice(env, &computed.to_array()));
-            combined.append(&Bytes::from_slice(env, &next.to_array()));
-            computed = env.crypto().sha256(&combined).into();
-        }
     }
 }

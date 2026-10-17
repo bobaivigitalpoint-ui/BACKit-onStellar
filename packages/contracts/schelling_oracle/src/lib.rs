@@ -30,7 +30,7 @@
 //!    correct instead, and locks up a bond (`>= total_pool_amount * bond_bps`).
 //!    This starts the **commit phase**, `voting_period_secs` long.
 //! 2. [`SchellingOracle::vote_on_dispute`] — during the commit phase, anyone
-//!    stakes `stake_amount` and submits `sha256(vote_outcome_be_bytes ++ salt)`
+//!    stakes `stake_amount` and submits `sha256(voter ++ vote_outcome_be_bytes ++ salt)`
 //!    rather than their vote in the clear, so nobody can copy the apparent
 //!    majority. This starts (once the commit phase ends) the **reveal phase**,
 //!    `reveal_period_secs` long.
@@ -63,6 +63,7 @@
 
 mod errors;
 mod events;
+pub mod price_votes;
 mod storage;
 mod types;
 
@@ -71,8 +72,10 @@ mod test;
 
 use errors::OracleError;
 use events::{
-    emit_dispute_opened, emit_dispute_resolved, emit_vote_committed, emit_vote_revealed,
+    emit_consensus_reached, emit_dispute_opened, emit_dispute_resolved, emit_vote_committed,
+    emit_vote_revealed,
 };
+use price_votes::{PriceRound, PriceVote};
 use soroban_sdk::{contract, contractimpl, token, Address, Bytes, BytesN, Env};
 use storage::*;
 use types::{Dispute, DisputeConfig, DisputeResult, VoteCommitment};
@@ -113,10 +116,15 @@ fn transfer_token(env: &Env, stake_token: &Address, from: &Address, to: &Address
     }
 }
 
-/// `sha256("schelling_vote:" ++ vote_outcome.to_be_bytes() ++ salt)`, mirroring
-/// `outcome_manager::submit_price_observation`'s canonical byte-message style.
-fn commitment_hash(env: &Env, vote_outcome: u32, salt: &BytesN<32>) -> BytesN<32> {
+/// `sha256("schelling_vote:" ++ voter ++ vote_outcome.to_be_bytes() ++ salt)`.
+///
+/// The voter's address is part of the preimage so a commitment cannot be
+/// copied: someone who re-submits another voter's hash during the commit phase
+/// cannot reveal it, because the hash no longer matches under their own address.
+fn commitment_hash(env: &Env, voter: &Address, vote_outcome: u32, salt: &BytesN<32>) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
     let mut raw = Bytes::from_slice(env, b"schelling_vote:");
+    raw.append(&voter.clone().to_xdr(env));
     raw.append(&Bytes::from_slice(env, &vote_outcome.to_be_bytes()));
     raw.append(&Bytes::from_slice(env, &salt.to_array()));
     env.crypto().sha256(&raw).into()
@@ -376,7 +384,7 @@ impl SchellingOracle {
             return Err(OracleError::AlreadyRevealed);
         }
 
-        let expected_hash = commitment_hash(&env, vote_outcome, &salt);
+        let expected_hash = commitment_hash(&env, &voter, vote_outcome, &salt);
         if expected_hash != commitment.commitment_hash {
             return Err(OracleError::CommitmentMismatch);
         }
@@ -572,6 +580,199 @@ impl SchellingOracle {
 
         emit_dispute_resolved(&env, dispute_id, result, distributed);
         Ok(())
+    }
+
+    // ── Stake-weighted price consensus (SC-021) and its commit-reveal mode (SC-022) ──
+
+    /// Open a price round for `market_id` (admin only). In a plain round voters call
+    /// `submit_price_vote` until `commit_deadline`. In a commit-reveal round they
+    /// call `commit_price_vote` until `commit_deadline` and `reveal_price_vote`
+    /// until `reveal_deadline`, so nobody can copy a visible vote.
+    pub fn open_price_round(
+        env: Env,
+        admin: Address,
+        market_id: u64,
+        stake_token: Address,
+        commit_deadline: u64,
+        reveal_deadline: u64,
+        commit_reveal: bool,
+    ) -> Result<(), OracleError> {
+        let config = get_config(&env).ok_or(OracleError::NotInitialized)?;
+        if config.admin != admin {
+            return Err(OracleError::Unauthorized);
+        }
+        admin.require_auth();
+        if price_votes::get_round(&env, market_id).is_some() {
+            return Err(OracleError::PriceRoundExists);
+        }
+        let now = env.ledger().timestamp();
+        let reveal_deadline = if commit_reveal { reveal_deadline } else { commit_deadline };
+        if commit_deadline <= now || reveal_deadline < commit_deadline {
+            return Err(OracleError::InvalidPeriod);
+        }
+        price_votes::set_round(
+            &env,
+            &PriceRound {
+                market_id,
+                stake_token,
+                commit_deadline,
+                reveal_deadline,
+                commit_reveal,
+                finalized: false,
+                median: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Stake behind a price in a plain round. One vote per voter.
+    pub fn submit_price_vote(
+        env: Env,
+        voter: Address,
+        market_id: u64,
+        price: i128,
+        stake_amount: i128,
+    ) -> Result<(), OracleError> {
+        voter.require_auth();
+        let round = price_votes::get_round(&env, market_id).ok_or(OracleError::PriceRoundNotFound)?;
+        if round.commit_reveal {
+            return Err(OracleError::WrongRoundKind);
+        }
+        if env.ledger().timestamp() >= round.commit_deadline {
+            return Err(OracleError::PriceVotingClosed);
+        }
+        if price <= 0 {
+            return Err(OracleError::InvalidPrice);
+        }
+        if stake_amount <= 0 {
+            return Err(OracleError::InvalidStakeAmount);
+        }
+        if price_votes::get_vote(&env, market_id, &voter).is_some() {
+            return Err(OracleError::AlreadyVoted);
+        }
+        price_votes::add_voter(&env, market_id, &voter)?;
+        price_votes::transfer(&env, &round.stake_token, &voter, &env.current_contract_address(), stake_amount);
+        price_votes::set_vote(
+            &env,
+            market_id,
+            &PriceVote {
+                voter,
+                stake: stake_amount,
+                price,
+                revealed: true,
+                commitment: BytesN::from_array(&env, &[0u8; 32]),
+            },
+        );
+        Ok(())
+    }
+
+    /// Phase 1 of a commit-reveal round: stake behind `commitment`, the value of
+    /// [`Self::price_commitment_hash`] for your own address, price and a secret salt.
+    pub fn commit_price_vote(
+        env: Env,
+        voter: Address,
+        market_id: u64,
+        commitment: BytesN<32>,
+        stake_amount: i128,
+    ) -> Result<(), OracleError> {
+        voter.require_auth();
+        let round = price_votes::get_round(&env, market_id).ok_or(OracleError::PriceRoundNotFound)?;
+        if !round.commit_reveal {
+            return Err(OracleError::WrongRoundKind);
+        }
+        if env.ledger().timestamp() >= round.commit_deadline {
+            return Err(OracleError::CommitPeriodEnded);
+        }
+        if stake_amount <= 0 {
+            return Err(OracleError::InvalidStakeAmount);
+        }
+        if price_votes::get_vote(&env, market_id, &voter).is_some() {
+            return Err(OracleError::AlreadyCommitted);
+        }
+        price_votes::add_voter(&env, market_id, &voter)?;
+        price_votes::transfer(&env, &round.stake_token, &voter, &env.current_contract_address(), stake_amount);
+        price_votes::set_vote(
+            &env,
+            market_id,
+            &PriceVote {
+                voter,
+                stake: stake_amount,
+                price: 0,
+                revealed: false,
+                commitment,
+            },
+        );
+        Ok(())
+    }
+
+    /// Phase 2: reveal the price and salt. The hash must match your commitment;
+    /// a voter who never reveals forfeits their whole stake when the round is
+    /// finalised.
+    pub fn reveal_price_vote(
+        env: Env,
+        voter: Address,
+        market_id: u64,
+        price: i128,
+        salt: BytesN<32>,
+    ) -> Result<(), OracleError> {
+        voter.require_auth();
+        let round = price_votes::get_round(&env, market_id).ok_or(OracleError::PriceRoundNotFound)?;
+        if !round.commit_reveal {
+            return Err(OracleError::WrongRoundKind);
+        }
+        let now = env.ledger().timestamp();
+        if now < round.commit_deadline {
+            return Err(OracleError::RevealPeriodNotStarted);
+        }
+        if now >= round.reveal_deadline {
+            return Err(OracleError::RevealPeriodEnded);
+        }
+        if price <= 0 {
+            return Err(OracleError::InvalidPrice);
+        }
+        let mut vote =
+            price_votes::get_vote(&env, market_id, &voter).ok_or(OracleError::NoCommitmentFound)?;
+        if vote.revealed {
+            return Err(OracleError::AlreadyRevealed);
+        }
+        if price_votes::price_commitment(&env, &voter, price, &salt) != vote.commitment {
+            return Err(OracleError::CommitmentMismatch);
+        }
+        vote.revealed = true;
+        vote.price = price;
+        price_votes::set_vote(&env, market_id, &vote);
+        Ok(())
+    }
+
+    /// Settle a round once voting (and revealing) has closed. Anyone may call it.
+    /// Computes the stake-weighted median, refunds consensus voters (within one
+    /// standard deviation) with a share of the slashed stake, and slashes outliers
+    /// by 10%. Returns the consensus price and emits `SchellingConsensusReached`.
+    pub fn finalize_price(env: Env, market_id: u64) -> Result<i128, OracleError> {
+        let config = get_config(&env).ok_or(OracleError::NotInitialized)?;
+        let round = price_votes::get_round(&env, market_id).ok_or(OracleError::PriceRoundNotFound)?;
+        if round.finalized {
+            return Err(OracleError::AlreadyFinalized);
+        }
+        if env.ledger().timestamp() < round.reveal_deadline {
+            return Err(OracleError::PriceVotingOpen);
+        }
+        let median = price_votes::finalize(&env, &config.admin, round)?;
+        emit_consensus_reached(&env, market_id, median);
+        Ok(median)
+    }
+
+    pub fn get_price_round(env: Env, market_id: u64) -> Result<PriceRound, OracleError> {
+        price_votes::get_round(&env, market_id).ok_or(OracleError::PriceRoundNotFound)
+    }
+
+    pub fn get_price_vote(env: Env, market_id: u64, voter: Address) -> Option<PriceVote> {
+        price_votes::get_vote(&env, market_id, &voter)
+    }
+
+    /// The commitment a voter must submit for `price` and `salt`.
+    pub fn price_commitment_hash(env: Env, voter: Address, price: i128, salt: BytesN<32>) -> BytesN<32> {
+        price_votes::price_commitment(&env, &voter, price, &salt)
     }
 
     pub fn get_dispute(env: Env, dispute_id: u64) -> Result<Dispute, OracleError> {

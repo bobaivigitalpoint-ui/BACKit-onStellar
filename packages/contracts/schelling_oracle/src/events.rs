@@ -3,6 +3,13 @@
 use crate::types::DisputeResult;
 use soroban_sdk::{Address, BytesN, Env};
 
+pub fn emit_consensus_reached(env: &Env, market_id: u64, median_price: i128) {
+    env.events().publish(
+        ("schelling_oracle", "SchellingConsensusReached"),
+        (market_id, median_price),
+    );
+}
+
 pub fn emit_dispute_opened(
     env: &Env,
     dispute_id: u64,

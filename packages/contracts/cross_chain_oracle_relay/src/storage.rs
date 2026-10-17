@@ -8,6 +8,36 @@ pub enum DataKey {
     RelayedBlocks(u64),
     CrossChainSources,
     Source(String),
+    /// Ethereum state root of a relayed block, by block number.
+    StateRoot(u64),
+    /// Ed25519 keys allowed to attest outcomes from a source chain.
+    ChainSigners(u64),
+    /// Set once an outcome for (chain, market) has been forwarded.
+    OutcomeRelayed(u64, u64),
+}
+
+pub fn set_state_root(env: &Env, block_number: u64, root: &BytesN<32>) {
+    env.storage().persistent().set(&DataKey::StateRoot(block_number), root);
+}
+
+pub fn get_state_root(env: &Env, block_number: u64) -> Option<BytesN<32>> {
+    env.storage().persistent().get(&DataKey::StateRoot(block_number))
+}
+
+pub fn set_chain_signers(env: &Env, chain_id: u64, signers: &soroban_sdk::Vec<BytesN<32>>) {
+    env.storage().persistent().set(&DataKey::ChainSigners(chain_id), signers);
+}
+
+pub fn get_chain_signers(env: &Env, chain_id: u64) -> Option<soroban_sdk::Vec<BytesN<32>>> {
+    env.storage().persistent().get(&DataKey::ChainSigners(chain_id))
+}
+
+pub fn is_outcome_relayed(env: &Env, chain_id: u64, market_id: u64) -> bool {
+    env.storage().persistent().has(&DataKey::OutcomeRelayed(chain_id, market_id))
+}
+
+pub fn mark_outcome_relayed(env: &Env, chain_id: u64, market_id: u64) {
+    env.storage().persistent().set(&DataKey::OutcomeRelayed(chain_id, market_id), &true);
 }
 
 pub fn set_config(env: &Env, config: &OracleRelayConfig) {

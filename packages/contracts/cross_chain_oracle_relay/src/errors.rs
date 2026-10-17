@@ -13,4 +13,13 @@ pub enum OracleRelayError {
     PriceOutOfRange = 7,
     InsufficientSignatures = 8,
     BlockAlreadyRelayed = 9,
+    /// No signers are configured for the source chain.
+    UnsupportedChain = 10,
+    /// The signer is not authorised for the source chain.
+    UnauthorizedSigner = 11,
+    /// This (chain, market) outcome has already been relayed.
+    OutcomeAlreadyRelayed = 12,
+    InvalidOutcome = 13,
+    /// The outcome manager rejected the forwarded outcome.
+    ForwardFailed = 14,
 }
